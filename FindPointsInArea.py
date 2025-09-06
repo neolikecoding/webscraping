@@ -4,6 +4,7 @@ import requests
 from shapely.geometry import Point, Polygon
 import xml.etree.ElementTree as ET
 import time
+import csv
 import json
 import os
 
@@ -84,6 +85,41 @@ def get_address_placemarks(points_kml_path):
             doc = f.read()
         placemarks = parse_placemarks_from_kml_string(doc)
     return placemarks
+
+
+def load_clustering_csv(path):
+    """Load clustering CSV that contains precomputed Latitude/Longitude.
+    Returns two dicts: by_placemark_name and by_normalized_address.
+    """
+    by_name = {}
+    by_addr = {}
+    if not os.path.exists(path):
+        return by_name, by_addr
+    with open(path, 'rt', encoding='utf-8', newline='') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                lat = float(row.get('Latitude') or row.get('Lat') or 0)
+                lon = float(row.get('Longitude') or row.get('Lon') or 0)
+            except Exception:
+                continue
+            name = row.get('placemark_name') or row.get('placemark') or ''
+            if name:
+                by_name[str(name).strip()] = (lon, lat)
+            addr = row.get('Address') or row.get('Address Line 1') or ''
+            if addr:
+                norm = normalize_address(addr)
+                by_addr[norm] = (lon, lat)
+    return by_name, by_addr
+
+
+def normalize_address(addr):
+    if not addr:
+        return ''
+    s = addr.upper().strip()
+    # remove extra whitespace and commas
+    s = ' '.join(s.replace(',', ' ').split())
+    return s
 
 
 def geocode_address(address, cache, email=None):
@@ -172,12 +208,17 @@ if __name__ == '__main__':
     # Load cache
     cache = load_geocode_cache(cache_path)
 
+    # Load clustering CSV maps
+    clustering_csv = 'Data/Desplaines Clustering.csv'
+    by_name_map, by_addr_map = load_clustering_csv(clustering_csv)
+
     # Find placemarks missing coordinates
     missing = [p for p in all_placemarks if p.get('lon') is None or p.get('lat') is None]
     print(f'Placemarks missing coordinates: {len(missing)}')
 
-    # Geocode a small sample to verify
-    for p in missing[:max_geocode_sample]:
+    # Geocode a small sample to verify (prefer clustering CSV where available)
+    sample = missing[:max_geocode_sample] if max_geocode_sample else missing
+    for p in sample:
         # build an address string: prefer <address>, else use ExtendedData fields
         addr = p.get('address_tag') or ''
         if not addr:
@@ -189,6 +230,26 @@ if __name__ == '__main__':
                     parts.append(v.strip())
             addr = ', '.join(parts)
         if not addr:
+            continue
+        # Try clustering CSV by placemark_name first
+        used = False
+        pm_name = p.get('name')
+        if pm_name and str(pm_name).strip() in by_name_map:
+            lon, lat = by_name_map[str(pm_name).strip()]
+            p['lon'] = lon
+            p['lat'] = lat
+            print(f"Used clustering CSV (name): {pm_name} -> {lon},{lat}")
+            used = True
+        else:
+            # try normalized address match
+            norm = normalize_address(addr)
+            if norm in by_addr_map:
+                lon, lat = by_addr_map[norm]
+                p['lon'] = lon
+                p['lat'] = lat
+                print(f"Used clustering CSV (addr): {addr} -> {lon},{lat}")
+                used = True
+        if used:
             continue
         lonlat = geocode_address(addr, cache, email=email)
         if lonlat and lonlat != (None, None):
